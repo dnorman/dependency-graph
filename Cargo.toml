@@ -1,0 +1,6 @@
+[package]
+name = "unbase-context-graph"
+version = "0.1.0"
+authors = ["Daniel Norman <daniel@gudtech.com>"]
+
+[dependencies]
