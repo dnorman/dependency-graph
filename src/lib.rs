@@ -1,27 +1,46 @@
-#![warn(bad_style, missing_docs,
-        unused, unused_extern_crates, unused_import_braces,
-        unused_qualifications, unused_results)]
+//! A Depdency Graph capable of topological iteration over cyclic dependencies and phantom dependencies.
+//!
+//! `DependencyGrap<K,P>` allows you to:
+//!
+//! * Insert a Payload enumerated by Key
+//! * Reference other dependent keys (which may or may not be present)
+//! * Insert dependent payloads after their dependees have already referenced them
+//! * Produce non-cyclic topological iterators over the potentially cyclic graph
+//! 
+//! TODOs;
+//! * Lock-free concurrency
+//! * Iterators reflect midstream graph changes for items topologically ascendent/descendent of present iteration
 
 type NodeId = usize;
+
 struct Node<K,P> {
     key: K,
-    refcount: isize,
-    payload: Option<P>,
-    relations: Vec<Option<NodeId>>,
+    refcount: usize,
+    state: NodeState<P>
+}
+enum NodeState<P>{
+    Phantom(),
+    Resident {
+        payload:  P,
+        relations: Vec<Option<NodeId>>,
+    }
 }
 
-pub struct DependencyGraph<K,T> {
-    nodes: Vec<Option<Node<K,T>>>,
+
+pub struct DependencyGraph<K,P> {
+    nodes: Vec<Option<Node<K,P>>>,
     vacancies: Vec<NodeId>,
 }
 
 impl<K,P> Node<K,P> {
-    fn new(key: K, maybe_payload: Option<P>) -> Self {
+    fn new(key: K, payload: P) -> Self {
         Node {
             key: key,
-            payload: maybe_payload,
             refcount: 0,
-            relations: Vec::new(),
+            state: NodeState::Resident {
+                payload: payload,
+                relations: Vec::new()
+            }
         }
     }
 }
@@ -58,7 +77,7 @@ impl<K,P> DependencyGraph<K,P> {
             })
             .collect()
     }
-    pub fn get_payload(&mut self, key: K) -> Option<P> where K: PartialEq, P: Clone {
+    pub fn get(&mut self, key: K) -> Option<P> where K: PartialEq, P: Clone {
         if let Some(&Some(ref mut Node)) =
              self.nodes.iter().find(|i| {
                 if let &&Some(ref it) = i {
@@ -76,7 +95,7 @@ impl<K,P> DependencyGraph<K,P> {
     /// Update the payload for a given subject. The previous payload is summarily overwritten.
     /// Any mrh.apply to the previous payload must be done externally, if desired
     /// relation_links must similarly be pre-calculated
-    pub fn set_payload(&mut self, key: K, dependencies: Vec<K>, payload: P)  where K: PartialEq, P: Clone {
+    pub fn insert(&mut self, key: K, payload: P, dependencies: Vec<K>)  where K: PartialEq, P: Clone {
         let node_id = {
             self.assert_node(key)
         };
@@ -88,7 +107,7 @@ impl<K,P> DependencyGraph<K,P> {
             self.set_relation(node_id, link);
         }
     }
-    pub fn remove_payload(&mut self, key: K )  where K: PartialEq, P: Clone  {
+    pub fn remove(&mut self, key: K ) where K: PartialEq, P: Clone  {
         if let Some(node_id) = self.nodes.iter().position(|i| {
             if let &Some(ref it) = i {
                 it.key == key
@@ -277,72 +296,73 @@ impl<K,P> DependencyGraph<K,P> {
     }
 }
 
-pub struct Subjectpayload {
-    pub key: K,
-    pub payload: MemoRefpayload,
-    pub from_keys: Vec<K>,
-    pub to_keys: Vec<K>,
-    pub refcount: usize,
-}
+// pub struct Subjectpayload {
+//     pub key: K,
+//     pub payload: MemoRefpayload,
+//     pub from_keys: Vec<K>,
+//     pub to_keys: Vec<K>,
+//     pub refcount: usize,
+// }
 
-pub struct SubjectpayloadIter<K,P> {
-    sorted: Vec<Subjectpayload>,
-}
-impl <K,P> Iterator for SubjectpayloadIter<K,P> {
-    type Item = Subjectpayload;
+// pub struct SubjectpayloadIter<K,P> {
+//     sorted: Vec<Subjectpayload>,
+// }
+// impl <K,P> Iterator for SubjectpayloadIter<K,P> {
+//     type Item = Subjectpayload;
 
-    fn next(&mut self) -> Option<Subjectpayload> {
-        self.sorted.pop()
-    }
-}
-impl<K,P> SubjectpayloadIter<K,P> {
-    fn new(nodes: &Vec<Option<Node<K,P>>>) -> Self {
-        // TODO: make this respond to context changes while we're mid-iteration.
-        // Approach A: switch Vec<Node> to Arc<Vec<Option<Node>>> and avoid slot reclamation until the iter is complete
-        // Approach B: keep Vec<Node> sorted (DESC) by refcount, and reset the increment whenever the sort changes
+//     fn next(&mut self) -> Option<Subjectpayload> {
+//         self.sorted.pop()
+//     }
+// }
 
-        // FOR now, taking the low road
-        // Vec<(usize, MemoRefpayload, Vec<K>)>
-        let mut subject_payloads: Vec<Subjectpayload> = nodes.iter()
-            .filter_map(|i| {
-                if let &Some(ref Node) = i {
-                    if let Some(ref payload) = Node.payload {
+// impl<K,P> SubjectpayloadIter<K,P> {
+//     fn new(nodes: &Vec<Option<Node<K,P>>>) -> Self {
+//         // TODO: make this respond to context changes while we're mid-iteration.
+//         // Approach A: switch Vec<Node> to Arc<Vec<Option<Node>>> and avoid slot reclamation until the iter is complete
+//         // Approach B: keep Vec<Node> sorted (DESC) by refcount, and reset the increment whenever the sort changes
 
-                        let relation_keys: Vec<K> = Node.relations
-                            .iter()
-                            .filter_map(|maybe_node_id| {
-                                if let &Some(node_id) = maybe_node_id {
-                                    if let Some(ref Node) = nodes[node_id] {
-                                        Some(Node.key)
-                                    } else {
-                                        panic!("sanity error, subject_payload_iter")
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+//         // FOR now, taking the low road
+//         // Vec<(usize, MemoRefpayload, Vec<K>)>
+//         let mut subject_payloads: Vec<Subjectpayload> = nodes.iter()
+//             .filter_map(|i| {
+//                 if let &Some(ref Node) = i {
+//                     if let Some(ref payload) = Node.payload {
 
-                        return Some(Subjectpayload {
-                            key: Node.key,
-                            refcount: Node.refcount as usize,
-                            payload: payload.clone(),
-                            from_keys: vec![],
-                            to_keys: relation_keys,
-                        });
-                    }
-                }
-                None
-            })
-            .collect();
+//                         let relation_keys: Vec<K> = Node.relations
+//                             .iter()
+//                             .filter_map(|maybe_node_id| {
+//                                 if let &Some(node_id) = maybe_node_id {
+//                                     if let Some(ref Node) = nodes[node_id] {
+//                                         Some(Node.key)
+//                                     } else {
+//                                         panic!("sanity error, subject_payload_iter")
+//                                     }
+//                                 } else {
+//                                     None
+//                                 }
+//                             })
+//                             .collect();
 
-        // Ascending sort here, because the iterator is using pop
-        // TODO: be sure to reverse this later if we switch to incremental calculation
-        subject_payloads.sort_by(|a, b| a.refcount.cmp(&b.refcount));
+//                         return Some(Subjectpayload {
+//                             key: Node.key,
+//                             refcount: Node.refcount as usize,
+//                             payload: payload.clone(),
+//                             from_keys: vec![],
+//                             to_keys: relation_keys,
+//                         });
+//                     }
+//                 }
+//                 None
+//             })
+//             .collect();
 
-        SubjectpayloadIter { sorted: subject_payloads }
-    }
-}
+//         // Ascending sort here, because the iterator is using pop
+//         // TODO: be sure to reverse this later if we switch to incremental calculation
+//         subject_payloads.sort_by(|a, b| a.refcount.cmp(&b.refcount));
+
+//         SubjectpayloadIter { sorted: subject_payloads }
+//     }
+// }
 
 #[cfg(test)]
 mod test {
@@ -350,157 +370,97 @@ mod test {
     use super::DependencyGraph;
 
     #[test]
-    fn context_manager_basic() {
-        let mut manager = DependencyGraph::new();
+    fn basic() {
+        let mut graph = DependencyGraph::new();
+        graph.insert("A", "Alpha",   vec![]);
+        graph.insert("B", "Bravo",   vec!["A"]);
+        graph.insert("C", "Charlie", vec!["B"]);
+        graph.insert("D", "Delta",   vec!["C"]);
 
-        let payload1 = slab.new_memo_basic_noparent(Some(1),
-                                     MemoBody::FullyMaterialized {
-                                         v: HashMap::new(),
-                                         r: RelationSlotSubjectpayload::empty(),
-                                     })
-            .to_payload();
-        manager.set_subject_payload(1, payload1.project_all_relation_links(&slab), payload1.clone());
-
-        let payload2 = slab.new_memo_basic_noparent(Some(2),
-                                     MemoBody::FullyMaterialized {
-                                         v: HashMap::new(),
-                                         r: RelationSlotSubjectpayload::single(0, 1, payload1),
-                                     })
-            .to_payload();
-        manager.set_subject_payload(2, payload2.project_all_relation_links(&slab), payload2.clone());
-
-        let payload3 = slab.new_memo_basic_noparent(Some(3),
-                                     MemoBody::FullyMaterialized {
-                                         v: HashMap::new(),
-                                         r: RelationSlotSubjectpayload::single(0, 2, payload2),
-                                     })
-            .to_payload();
-        manager.set_subject_payload(3, payload3.project_all_relation_links(&slab), payload3.clone());
-
-        let payload4 = slab.new_memo_basic_noparent(Some(4),
-                                     MemoBody::FullyMaterialized {
-                                         v: HashMap::new(),
-                                         r: RelationSlotSubjectpayload::single(0, 3, payload3),
-                                     })
-            .to_payload();
-        manager.set_subject_payload(4, payload4.project_all_relation_links(&slab), payload4);
-
-        let mut iter = manager.subject_payload_iter();
-        assert_eq!(1, iter.next().expect("iter result 1 should be present").key);
-        assert_eq!(2, iter.next().expect("iter result 2 should be present").key);
-        assert_eq!(3, iter.next().expect("iter result 3 should be present").key);
-        assert_eq!(4, iter.next().expect("iter result 4 should be present").key);
-        assert!(iter.next().is_none(), "iter should have ended");
+        let mut iter = graph.iter();
+        assert_eq!("A", iter.next().expect("should be present").key);
+        assert_eq!("B", iter.next().expect("should be present").key);
+        assert_eq!("C", iter.next().expect("should be present").key);
+        assert_eq!("D", iter.next().expect("should be present").key);
+        assert!(iter.next().is_none(), "should have ended");
     }
 
     #[test]
-    fn context_manager_dual_indegree_zero() {
-        let net = Network::create_new_system();
-        let slab = Slab::new(&net);
-        let mut manager = DependencyGraph::new();
+    fn belated() {
+        let mut graph = DependencyGraph::new();
+        graph.insert("A", "Alpha",   vec!["D"]);
+        graph.insert("B", "Bravo",   vec!["A"]);
+        graph.insert("C", "Charlie", vec!["B"]);
+        graph.insert("D", "Delta",   vec![]);
 
-        // Subject 1 is pointing to nooobody
-        let payload1 = slab.new_memo_basic_noparent(Some(1), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::empty() }).to_payload();
-        manager.set_subject_payload(1, payload1.project_all_relation_links(&slab), payload1.clone());
-
-        // Subject 2 slot 0 is pointing to Subject 1
-        let payload2 = slab.new_memo_basic_noparent(Some(2), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 1, payload1.clone()) }).to_payload();
-        manager.set_subject_payload(2, payload2.project_all_relation_links(&slab), payload2.clone());
-
-        //Subject 3 slot 0 is pointing to nobody
-        let payload3 = slab.new_memo_basic_noparent(Some(3), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::empty() }).to_payload();
-        manager.set_subject_payload(3, payload3.project_all_relation_links(&slab), payload3.clone());
-
-        // Subject 4 slot 0 is pointing to Subject 3
-        let payload4 = slab.new_memo_basic_noparent(Some(4), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 3, payload3.clone()) }).to_payload();
-        manager.set_subject_payload(4, payload4.project_all_relation_links(&slab), payload4);
-
-
-        // 2[0] -> 1
-        // 4[0] -> 3
-        let mut iter = manager.subject_payload_iter();
-        // for subject_payload in iter {
-        //     println!("{} is {}", subject_payload.key, subject_payload.refcount );
-        // }
-        assert_eq!(3, iter.next().expect("iter result 3 should be present").key);
-        assert_eq!(1, iter.next().expect("iter result 1 should be present").key);
-        assert_eq!(4, iter.next().expect("iter result 4 should be present").key);
-        assert_eq!(2, iter.next().expect("iter result 2 should be present").key);
-        assert!(iter.next().is_none(), "iter should have ended");
+        let mut iter = graph.iter();
+        assert_eq!("D", iter.next().expect("should be present").key);
+        assert_eq!("A", iter.next().expect("should be present").key);
+        assert_eq!("B", iter.next().expect("should be present").key);
+        assert_eq!("C", iter.next().expect("should be present").key);
+        assert!(iter.next().is_none(), "should have ended");
     }
-        #[test]
-    fn context_manager_repoint_relation() {
-        let net = Network::create_new_system();
-        let slab = Slab::new(&net);
-        let mut manager = DependencyGraph::new();
 
-        // Subject 1 is pointing to nooobody
-        let payload1 = slab.new_memo_basic_noparent(Some(1), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::empty() }).to_payload();
-        manager.set_subject_payload(1, payload1.project_all_relation_links(&slab), payload1.clone());
+    #[test]
+    fn dual_indegree_zero() {
+        let mut graph = DependencyGraph::new();
+        graph.insert("A", "Alpha",   vec![]);
+        graph.insert("B", "Bravo",   vec!["A"]);
+        graph.insert("C", "Charlie", vec![]);
+        graph.insert("D", "Delta",   vec!["C"]);
 
-        // Subject 2 slot 0 is pointing to Subject 1
-        let payload2 = slab.new_memo_basic_noparent(Some(2), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 1, payload1.clone()) }).to_payload();
-        manager.set_subject_payload(2, payload2.project_all_relation_links(&slab), payload2.clone());
+        let mut iter = graph.iter();
+        assert_eq!("C", iter.next().expect("should be present").key);
+        assert_eq!("A", iter.next().expect("should be present").key);
+        assert_eq!("D", iter.next().expect("should be present").key);
+        assert_eq!("B", iter.next().expect("should be present").key);
+        // Arguably ACBD, CDAB, and ABCD are topologically equivalent
 
-        //Subject 3 slot 0 is pointing to nobody
-        let payload3 = slab.new_memo_basic_noparent(Some(3), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::empty() }).to_payload();
-        manager.set_subject_payload(3, payload3.project_all_relation_links(&slab), payload3.clone());
+        assert!(iter.next().is_none(), "should have ended");
+    }
 
-        // Subject 4 slot 0 is pointing to Subject 3
-        let payload4 = slab.new_memo_basic_noparent(Some(4), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 3, payload3.clone()) }).to_payload();
-        manager.set_subject_payload(4, payload4.project_all_relation_links(&slab), payload4.clone());
+    #[test]
+    fn repoint_relation() {
 
-        // Repoint Subject 2 slot 0 to subject 4
-        let payload2_b = slab.new_memo_basic(Some(2), payload2, MemoBody::Relation(RelationSlotSubjectpayload::single(0,4,payload4) )).to_payload();
-        manager.set_subject_payload(4, payload2_b.project_all_relation_links(&slab), payload2_b);
-
-
-        // 2[0] -> 1
-        // 4[0] -> 3
+        let mut graph = DependencyGraph::new();
+        // B -> A
+        // D -> C
         // Then:
-        // 2[0] -> 4
-        
-        let mut iter = manager.subject_payload_iter();
-        // for subject_payload in iter {
-        //     println!("{} is {}", subject_payload.key, subject_payload.refcount );
-        // }
-        assert_eq!(1, iter.next().expect("iter result 1 should be present").key);
-        assert_eq!(4, iter.next().expect("iter result 4 should be present").key);
-        assert_eq!(3, iter.next().expect("iter result 3 should be present").key);
-        assert_eq!(2, iter.next().expect("iter result 2 should be present").key);
+        // B -> D
+        // Thus:
+        // B -> D -> C
+        // A
+        graph.insert("A", "Alpha",   vec![]);
+        graph.insert("B", "Bravo",   vec!["A"]);
+        graph.insert("C", "Charlie", vec![]);
+        graph.insert("D", "Delta",   vec!["C"]);
+        graph.insert("B", "Bravo",   vec!["D"]);
+
+        let mut iter = graph.iter();
+        assert_eq!("C", iter.next().expect("should be present").key);
+        assert_eq!("D", iter.next().expect("should be present").key);
+        assert_eq!("B", iter.next().expect("should be present").key);
+        assert_eq!("A", iter.next().expect("should be present").key);
         assert!(iter.next().is_none(), "iter should have ended");
     }
     #[test]
-    fn context_manager_remove() {
-        let net = Network::create_new_system();
-        let slab = Slab::new(&net);
-        let mut manager = DependencyGraph::new();
+    fn remove() {
 
-        // Subject 1 is pointing to nooobody
-        let payload1 = slab.new_memo_basic_noparent(Some(1), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::empty() }).to_payload();
-        manager.set_subject_payload(1, payload1.project_all_relation_links(&slab), payload1.clone());
+        let mut graph = DependencyGraph::new();
+        graph.insert("A", "Alpha",   vec![]);
+        graph.insert("B", "Bravo",   vec!["A"]);
+        graph.insert("C", "Charlie", vec!["B"]);
+        graph.insert("D", "Delta",   vec!["C"]);
 
-        // Subject 2 slot 0 is pointing to Subject 1
-        let payload2 = slab.new_memo_basic_noparent(Some(2), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 1, payload1.clone()) }).to_payload();
-        manager.set_subject_payload(2, payload2.project_all_relation_links(&slab), payload2.clone());
+        graph.remove("B");
 
-        //Subject 3 slot 0 is pointing to Subject 2
-        let payload3 = slab.new_memo_basic_noparent(Some(3), MemoBody::FullyMaterialized { v: HashMap::new(), r: RelationSlotSubjectpayload::single(0, 2, payload2.clone()) }).to_payload();
-        manager.set_subject_payload(3, payload3.project_all_relation_links(&slab), payload3.clone());
+        // Was: D -> C -> B -> A
+        // Now: D -> C, A
 
-
-        // 2[0] -> 1
-        // 3[0] -> 2
-        // Subject 1 should have refcount = 2
-
-        manager.remove_subject_payload(2);
-        
-        let mut iter = manager.subject_payload_iter();
-        // for subject_payload in iter {
-        //     println!("{} is {}", subject_payload.key, subject_payload.refcount );
-        // }
-        assert_eq!(3, iter.next().expect("iter result 3 should be present").key);
-        assert_eq!(1, iter.next().expect("iter result 1 should be present").key);
-        assert!(iter.next().is_none(), "iter should have ended");
+        let mut iter = graph.iter();
+        assert_eq!("C", iter.next().expect("should be present").key);
+        assert_eq!("D", iter.next().expect("should be present").key);
+        assert_eq!("A", iter.next().expect("should be present").key);
+        assert!(iter.next().is_none(), "should have ended");
     }
 }
