@@ -1,9 +1,9 @@
 //! A Directed Graph capable of topological iteration, with cyclic and phantom dependencies.
 //!
-//! `DependencyGraph<K,V>` allows you to:
+//! `DependencyGraph<K,V,E>` allows you to:
 //!
 //! * Insert a Value for a given Vertex key
-//! * Reference other Vertexs upon which a given Vertex depends (which may or may not be present in the graph)
+//! * Record directed edges, each with its own measure(value) to another Vertex, which may or may not be present in the graph
 //! * Insert payloads after their dependees have already referenced them
 //! * Produce non-cyclic topological iterators over the potentially cyclic graph
 //! 
@@ -15,14 +15,14 @@
 use std::sync::{Mutex,RwLock,Arc};
 
 struct Vertex<K,V,E> {
-    key: K,
+    key: Mutex<Option<K>>,
     refcount: Mutex<usize>,
     state: Mutex<VertexState<K,V,E>>
 }
 
 struct Edge<K,V,E> {
     measure: Option<E>,
-    vertex: Arc<Vertex<K,V,E>>
+    dest_vertex: Arc<Vertex<K,V,E>>
 }
 enum VertexState<K,V,E>{
     Phantom,
@@ -34,18 +34,71 @@ enum VertexState<K,V,E>{
 
 #[derive(Clone)]
 pub struct DependencyGraph<K,V,M> {
-    vertexes: Arc<Mutex<Vec<Arc<Vertex<K,V,M>>>>>,
+    vertex_vec: Arc<Mutex<Vec<Arc<Vertex<K,V,M>>>>>,
 }
 
 impl<K,V,E> Vertex<K,V,E> {
     fn new(key: K, value: V) -> Self {
         Vertex {
-            key: key,
-            refcount: 0,
+            key: Mutex::new(Some(key)),
+            refcount: Mutex::new(0),
             state: Mutex::new(VertexState::Resident {
                 value: value,
                 edges: Vec::new()
             })
+        }
+    }
+
+    /// Find the dest vertex, or create using a given VertexState
+    /// Either way increment its refcount
+    /// For the time being, this refcount is redundant with that of the Arc. This will be remedied later.
+    fn assert (key: K, vertex_vec: &mut Vec<Arc<Vertex<K,V,E>>>, default_state: VertexState<K,V,E>) -> Arc<Self>
+        where K: PartialEq+Ord {
+        //match vertex_vec.binary_search_by(|n| n.key.lock().unwrap().cmp(&Some(key)) ) {
+        match vertex_vec.iter().find(|n| *n.key.lock().unwrap() == Some(key) ) {
+                //Ok(i) => {
+                Some(vertex) => {
+                    //let vertex = vertex_vec[i].clone();
+                    vertex.increment();
+                    vertex.clone()
+                }
+                //Err(i) => {
+                None => {
+                    // Seaerch for an empty slot
+                    match vertex_vec.iter().find(|n| *n.key.lock().unwrap() == None) {
+                        Some(vertex) => {
+                            // Found one
+                            *vertex.key.lock().unwrap() = Some(key);
+                            *vertex.refcount.lock().unwrap() = 1;
+                            *vertex.state.lock().unwrap() = default_state;
+                            vertex.clone()
+                        },
+                        None => {
+                            // No empty slots, just insert
+                            let vertex = Arc::new(Vertex{
+                                key: Mutex::new(Some(key)),
+                                refcount: Mutex::new(1),
+                                state: Mutex::new(default_state)
+                            });;
+                            vertex_vec.push(vertex.clone());
+                            //vertex_vec.insert(i, vertex.clone());
+
+                            vertex
+                        }
+                    }
+                }
+            }
+    }
+    fn increment(&self) {
+        *self.refcount.lock().unwrap() += 1;
+    }
+    fn decrement (&self) {
+        let refcount = self.refcount.lock().unwrap();
+        *refcount -= 1;
+        if *refcount == 0 {
+            if let VertexState::Phantom = *self.state.lock().unwrap() {
+                *self.key.lock().unwrap() = None;
+            }
         }
     }
 }
@@ -56,77 +109,47 @@ impl<K,V,E> VertexState<K,V,E> {
 }
 
 impl <K,V,E> Edge<K,V,E>{
-    fn new (key: K, measure: Option<E>, all_vertexes: &mut Vec<Arc<Vertex<K,V,E>>>) -> Self {
-        let vertex = match all_vertexes.binary_search_by(|n| n.key.cmp(&key) ) {
-            Ok(i) => {
-                let vertex = all_vertexes[i].clone();
-                *vertex.refcount.lock().unwrap() += 1;
-                vertex
+    fn new (dest_key: K, measure: Option<E>, vertex_vec: &mut Vec<Arc<Vertex<K,V,E>>>) -> Self 
+        where K: Ord {
+            Edge{ 
+                measure,
+                dest_vertex: Vertex::assert( dest_key, vertex_vec, VertexState::Phantom )
             }
-            Err(i) => {
-                let vertex = Arc::new(Vertex{ 
-                    key: key,
-                    refcount: Mutex::new(1),
-                    state: Mutex::new(VertexState::Phantom)
-                });
-                all_vertexes.insert(i, vertex.clone());
-                vertex
-            }
-        };
-
-        Edge{ 
-            measure,
-            vertex
-        }
     }
 }
 impl <K,V,E> Drop for Edge<K,V,E> {
     fn drop (&mut self) {
-        *self.vertex.refcount.lock().unwrap() -= 1;
+        // Droping this edge, decrement the dest_vertex refcount
+        self.dest_vertex.decrement()
     }
 }
 
 impl<K,V,E> DependencyGraph<K,V,E> {
     pub fn new() -> DependencyGraph<K,V,E> {
         DependencyGraph {
-            vertexes: Arc::new(Mutex::new(Vec::with_capacity(30))),
+            vertex_vec: Arc::new(Mutex::new(Vec::with_capacity(30))),
         }
     }
 
     /// Insert a value and Vec of dependencies for a given key. If the Graph already had this key, the value is updated.
     /// Dependencies which are not already inserted will be created as phantom Vertexs.
-    pub fn insert(&mut self, key: K, value: V, edge_tuples: Vec<(Option<E>,K)>)  where K: PartialEq+Ord, V: Clone {
-        let vertexes = self.vertexes.lock().unwrap();
+    pub fn insert(&mut self, key: K, value: V, edge_tuples: Vec<(K,Option<E>)>)
+        where K: PartialEq+Ord, V: Clone {
+        let vertex_vec = self.vertex_vec.lock().unwrap();
 
-        // first increment
-        let edges = edge_tuples.drain(..).map(|(m,k)| Edge::new(k,m,&mut vertexes) ).collect();
-
-        match vertexes.binary_search_by(|n| n.key.cmp(&key) ) {
-            Ok(i) => {
-                let vertex = vertexes[i];
-                *vertex.state.lock().unwrap() = VertexState::Resident{
-                    value,
-                    edges: edges
-                };
-            }
-            Err(i) => {
-                vertexes.insert(i, Arc::new(Vertex{ 
-                    key: key,
-                    refcount: Mutex::new(0),
-                    state: Mutex::new(VertexState::Resident{
-                        value,
-                        edges: edges
-                    })
-                }))
-            }
-        }
+        let edges = edge_tuples.drain(..).map(|(k,m)| Edge::new(k, m, &mut *vertex_vec) ).collect();
+        let vertex = Vertex::assert( key, &mut *vertex_vec, VertexState::Phantom );
+        *vertex.state.lock().unwrap() = VertexState::Resident{
+            value,
+            edges: edges
+        };
     }
     pub fn remove(&mut self, key: K ) where K: PartialEq, V: Clone  {
         unimplemented!()
     }
 
-    pub fn iter(&self) -> SomethingIter {
-        unimplemented!()
+    pub fn iter(&self) -> TopoIter<K,V,E> {
+        TopoIter::new(self.vertex_vec.clone())
     }
     // /// Returns true if the `DependencyGraph` contains no entries.
     // #[allow(dead_code)]
@@ -346,29 +369,27 @@ impl<K,V,E> DependencyGraph<K,V,E> {
     // }
 }
 
-pub struct SomethingIter {}
+pub struct TopoIter<K,V,E> {
+    visited: Vec<K>,
+    vertex_vec: Arc<Mutex<Vec<Arc<Vertex<K,V,E>>>>>
+}
 
-// pub struct Subjectpayload {
-//     pub key: K,
-//     pub payload: MemoRefpayload,
-//     pub from_keys: Vec<K>,
-//     pub to_keys: Vec<K>,
-//     pub refcount: usize,
-// }
+impl <K,V,E> Iterator for TopoIter<K,V,E> {
+    type Item = Vertex<K,V,E>;
 
-// pub struct SubjectpayloadIter<K,V> {
-//     sorted: Vec<Subjectpayload>,
-// }
-// impl <K,V> Iterator for SubjectpayloadIter<K,V> {
-//     type Item = Subjectpayload;
+    fn next(&mut self) -> Option<Vertex> {
+        self.sorted.pop()
+    }
+}
 
-//     fn next(&mut self) -> Option<Subjectpayload> {
-//         self.sorted.pop()
-//     }
-// }
-
-// impl<K,V> SubjectpayloadIter<K,V> {
-//     fn new(Vertexs: &Vec<Option<Vertex<K,V>>>) -> Self {
+impl<K,V,E> TopoIter<K,V,E> {
+     fn new(vertex_vec: Arc<Mutex<Vec<Arc<Vertex<K,V,E>>>>>) -> Self {
+         TopoIter{
+             visited: Vec::new(),
+             vertex_vec: vertex_vec
+         }
+     }
+}
 //         // TODO: make this respond to context changes while we're mid-iteration.
 //         // Approach A: switch Vec<Vertex> to Arc<Vec<Option<Vertex>>> and avoid slot reclamation until the iter is complete
 //         // Approach B: keep Vec<Vertex> sorted (DESC) by refcount, and reset the increment whenever the sort changes
@@ -425,9 +446,9 @@ mod test {
     fn basic() {
         let mut graph = DependencyGraph::new();
         graph.insert("A", "Alpha",   vec![]);
-        graph.insert("B", "Bravo",   vec![(None,"A")];
-        graph.insert("C", "Charlie", vec![(None,"B")];
-        graph.insert("D", "Delta",   vec![(None,"C")];
+        graph.insert("B", "Bravo",   vec![("A",None)];
+        graph.insert("C", "Charlie", vec![("B",None)];
+        graph.insert("D", "Delta",   vec![("C",None)];
 
         let mut iter = graph.iter();
         assert_eq!("A", iter.next().expect("should be present").key);
@@ -440,9 +461,9 @@ mod test {
     #[test]
     fn belated() {
         let mut graph = DependencyGraph::new();
-        graph.insert("A", "Alpha",   vec![(None,"D")]);
-        graph.insert("B", "Bravo",   vec![(None,"A")]);
-        graph.insert("C", "Charlie", vec![(None,"B")]);
+        graph.insert("A", "Alpha",   vec![("D",None)]);
+        graph.insert("B", "Bravo",   vec![("A",None)]);
+        graph.insert("C", "Charlie", vec![("B",None)]);
         graph.insert("D", "Delta",   vec![]);
 
         let mut iter = graph.iter();
@@ -457,9 +478,9 @@ mod test {
     fn dual_indegree_zero() {
         let mut graph = DependencyGraph::new();
         graph.insert("A", "Alpha",   vec![]);
-        graph.insert("B", "Bravo",   vec![(None,"A")]);
+        graph.insert("B", "Bravo",   vec![("A",None)]);
         graph.insert("C", "Charlie", vec![]);
-        graph.insert("D", "Delta",   vec![(None,"C")]);
+        graph.insert("D", "Delta",   vec![("C",None)]);
 
         let mut iter = graph.iter();
         assert_eq!("C", iter.next().expect("should be present").key);
@@ -483,10 +504,10 @@ mod test {
         // B -> D -> C
         // A
         graph.insert("A", "Alpha",   vec![]);
-        graph.insert("B", "Bravo",   vec![(None,"A")]);
+        graph.insert("B", "Bravo",   vec![("A",None)]);
         graph.insert("C", "Charlie", vec![]);
-        graph.insert("D", "Delta",   vec![(None,"C")]);
-        graph.insert("B", "Bravo",   vec![(None,"D")]);
+        graph.insert("D", "Delta",   vec![("C",None)]);
+        graph.insert("B", "Bravo",   vec![("D",None)]);
 
         let mut iter = graph.iter();
         assert_eq!("C", iter.next().expect("should be present").key);
@@ -500,9 +521,9 @@ mod test {
 
         let mut graph = DependencyGraph::new();
         graph.insert("A", "Alpha",   vec![]);
-        graph.insert("B", "Bravo",   vec![(None,"A")]);
-        graph.insert("C", "Charlie", vec![(None,"B")]);
-        graph.insert("D", "Delta",   vec![(None,"C")]);
+        graph.insert("B", "Bravo",   vec![("A",None)]);
+        graph.insert("C", "Charlie", vec![("B",None)]);
+        graph.insert("D", "Delta",   vec![("C",None)]);
 
         graph.remove("B");
 
